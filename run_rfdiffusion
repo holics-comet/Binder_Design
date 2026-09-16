@@ -1,0 +1,608 @@
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+# ============================================================
+# 기본 경로 설정
+# ============================================================
+#
+# run_rfdiffusion.py가 존재하는 디렉터리를 프로젝트 root로 사용한다.
+#
+# 예:
+# /home01/User_ID/RFdiffusion3/
+#
+# ├── run_rfdiffusion.py
+# ├── RFdiffusion/
+# ├── inputs/
+# ├── outputs/
+# └── jobs/
+
+
+ROOT = Path(__file__).resolve().parent
+RF_DIR = ROOT / "RFdiffusion"
+MODEL_DIR = RF_DIR / "models"
+OUTPUT_DIR = ROOT / "outputs"
+
+
+# ============================================================
+# 사용할 RFdiffusion checkpoint
+# ============================================================
+#
+# base
+#   - 일반적인 monomer generation, motif scaffolding
+#
+# complex
+#   - protein-protein interaction, binder design
+#
+# beta
+#   - beta-sheet이 많은 구조를 생성할 때 사용할 수 있는 checkpoint
+
+CHECKPOINTS = {
+    "base": MODEL_DIR / "Base_ckpt.pt",
+    "complex": MODEL_DIR / "Complex_base_ckpt.pt",
+    "beta": MODEL_DIR / "Complex_beta_ckpt.pt",
+}
+
+
+# checkpoint 자동 선택
+def choose_model(args, contig):
+
+    # 사용자가 --model을 직접 지정했다면 그대로 사용
+    if args.model != "auto":
+        return args.model
+
+    # hotspot이 있거나 RFdiffusion native binder syntax인 "/0"가 contig에 있으면 complex checkpoint 선택
+    if args.hotspot or "/0" in contig:
+        return "complex"
+
+    # 그 외에는 기본 모델 사용
+    return "base"
+
+
+# Live visualization용 directory 생성
+def make_live_directory(output_name, user_live_dir=None):
+
+    # 사용자가 직접 --live-dir를 지정했다면 그것을 사용한다.
+    if user_live_dir:
+        live_dir = Path(user_live_dir).expanduser().resolve()
+
+    else:
+        # ----------------------------------------------------
+        # HPC에서는 compute node의 /dev/shm이
+        # login node에서 보이지 않을 수 있다.
+        #
+        # 따라서 compute node와 login node에서 동시에 접근 가능한
+        # /scratch를 사용한다.
+        # ----------------------------------------------------
+
+        user = os.environ.get("USER", "unknown_user")
+
+        # Slurm job에서 실행 중이면 job ID를 가져온다.
+        job_id = os.environ.get("SLURM_JOB_ID")
+
+        # 직접 python으로 실행한 경우에도 충돌하지 않도록 PID 사용
+        if job_id is None:
+            job_id = f"local_{os.getpid()}"
+
+        live_dir = (
+            Path("/scratch")
+            / user
+            / "rfdiffusion_live"
+            / f"{output_name}_{job_id}"
+        )
+
+    live_dir.mkdir(parents=True, exist_ok=True)
+
+    return live_dir
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Server launcher for RFdiffusion"
+    )
+
+
+    # Input PDB
+    # --input /home01/.../target.pdb
+    # unconditional generation이면 생략 가능
+
+    parser.add_argument(
+        "--input",
+        help="Input PDB file. Omit for unconditional generation."
+    )
+
+    # Contig
+    # 일반 RFdiffusion / motif scaffolding에서는 native contig를 직접 입력한다.
+    # Binder convenience mode를 사용할 때는 생략하고
+    # --target-contig와 --binder-length를 사용하면 된다.
+    parser.add_argument(
+        "--contig",
+        default=None,
+        help=(
+            "Native RFdiffusion contig syntax. "
+            "Example: '150-150' or 'A1-150/0 80-120'"
+        )
+    )
+
+    # Binder design convenience options
+    parser.add_argument(
+        "--target-contig",
+        default=None,
+        help=(
+            "Target residue range for binder design. "
+            "Example: A1-150"
+        )
+    )
+
+    parser.add_argument(
+        "--binder-length",
+        default=None,
+        help=(
+            "Binder length or length range. "
+            "Examples: 100 or 80-120"
+        )
+    )
+
+    # Hotspot
+    parser.add_argument(
+        "--hotspot",
+        default=None,
+        help="Comma-separated target hotspot residues, e.g. A37,A40,A41"
+    )
+
+
+    # Output experiment name
+    parser.add_argument(
+        "--output",
+        required=True,
+        help="Experiment name, e.g. binder_test"
+    )
+
+
+    # 생성할 design 개수
+    parser.add_argument(
+        "--num-designs",
+        type=int,
+        default=1
+    )
+
+
+    # checkpoint 선택
+    parser.add_argument(
+        "--model",
+        choices=["auto", "base", "complex", "beta"],
+        default="auto",
+        help="Checkpoint selection"
+    )
+
+
+    # --------------------------------------------------------
+    # Diffusion timestep
+    # --------------------------------------------------------
+    #
+    # 지정하지 않으면 checkpoint의 기본 T 사용
+    #
+    # Base checkpoint의 기본값은 T=50, 이외로도 T>=15여야 한다
+
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="Override diffuser.T. If omitted, use checkpoint/config default."
+    )
+
+
+    # partial diffusion
+    parser.add_argument(
+        "--partial-t",
+        type=int,
+        default=None,
+        help="Enable partial diffusion with diffuser.partial_T."
+    )
+
+
+    # output numbering 시작값
+    parser.add_argument(
+        "--startnum",
+        type=int,
+        default=0
+    )
+
+
+    # ========================================================
+    # LIVE visualization option
+    # ========================================================
+    #
+    # --live를 지정하면 RFdiffusion이 timestep마다 PDB를 별도의 shared directory에 저장한다.
+    # 이 PDB들을 VS Code Jupyter / py3Dmol viewer가 읽어서 실시간으로 구조를 표시할 수 있다.
+
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Dump timestep PDB files during diffusion for "
+            "real-time visualization."
+        )
+    )
+
+
+    # 원하는 경우 live PDB 저장 경로 직접 지정
+    parser.add_argument(
+        "--live-dir",
+        default=None,
+        help=(
+            "Directory for live timestep PDB files. "
+            "Default: /scratch/$USER/rfdiffusion_live/<output>_<jobid>"
+        )
+    )
+
+
+    args = parser.parse_args()
+
+    # 기본 validation
+    if not (RF_DIR / "run_inference.py").is_file():
+        raise FileNotFoundError(
+            f"RFdiffusion run_inference.py not found: {RF_DIR}"
+        )
+
+
+    # T < 15는 RFdiffusion 자체에서 오류가 발생하므로 launcher 단계에서 미리 차단
+    if args.steps is not None and args.steps < 15:
+        raise ValueError(
+            "--steps must be >= 15. "
+            "RFdiffusion discrete diffusion schedule does not support T < 15."
+        )
+
+    # ========================================================
+    # Contig 결정
+    # ========================================================
+    #
+    # 두 가지 입력 방식을 지원한다.
+    #
+    # 1) Native RFdiffusion mode
+    #    --contig "A1-150/0 80-120"
+    #
+    # 2) Binder convenience mode
+    #    --target-contig A1-150 --binder-length 80-120
+    #
+    # Binder convenience mode에서는 launcher가 자동으로
+    # "A1-150/0 80-120" 형태의 native contig를 만든다.
+
+    binder_mode = (
+        args.target_contig is not None
+        or args.binder_length is not None
+    )
+
+    if binder_mode:
+        if args.contig is not None:
+            raise ValueError(
+                "Use either --contig OR "
+                "--target-contig/--binder-length, not both."
+            )
+
+        if args.input is None:
+            raise ValueError(
+                "Binder convenience mode requires --input."
+            )
+
+        if args.target_contig is None:
+            raise ValueError(
+                "Binder convenience mode requires --target-contig."
+            )
+
+        if args.binder_length is None:
+            raise ValueError(
+                "Binder convenience mode requires --binder-length."
+            )
+
+        contig = f"{args.target_contig}/0 {args.binder_length}"
+
+    else:
+        if args.contig is None:
+            raise ValueError(
+                "Provide --contig, or use both "
+                "--target-contig and --binder-length."
+            )
+
+        contig = args.contig
+
+    # 모델 checkpoint 결정
+    # Binder syntax(/0) 또는 hotspot이 있으면 auto mode에서 complex checkpoint 선택
+    model = choose_model(args, contig)
+    ckpt = CHECKPOINTS[model]
+
+    if not ckpt.is_file():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {ckpt}"
+        )
+
+    # Input PDB 처리
+    input_pdb = None
+
+    if args.input:
+
+        input_pdb = Path(
+            args.input
+        ).expanduser().resolve()
+
+        if not input_pdb.is_file():
+            raise FileNotFoundError(
+                f"Input PDB not found: {input_pdb}"
+            )
+
+    # 최종 output directory
+    run_dir = (
+        OUTPUT_DIR / args.output
+    ).resolve()
+
+    run_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    output_prefix = run_dir / args.output
+
+    # RFdiffusion command 생성
+    cmd = [
+
+        # 현재 conda environment의 python 사용
+        sys.executable,
+
+        # RFdiffusion inference script
+        str(RF_DIR / "run_inference.py"),
+
+        # 결과 저장 prefix  
+        f"inference.output_prefix={output_prefix}",
+
+        # design 개수
+        f"inference.num_designs={args.num_designs}",
+
+        # numbering 시작
+        f"inference.design_startnum={args.startnum}",
+
+        # 사용할 checkpoint
+        f"inference.ckpt_override_path={ckpt}",
+
+        # contig
+        f"contigmap.contigs=[{contig}]",
+    ]
+
+
+    # Optional input PDB
+    if input_pdb is not None:
+        cmd.append(
+            f"inference.input_pdb={input_pdb}"
+        )
+
+    # Hotspot
+    if args.hotspot:
+
+        hotspots = ",".join(
+            x.strip()
+            for x in args.hotspot.split(",")
+            if x.strip()
+        )
+
+        cmd.append(
+            f"ppi.hotspot_res=[{hotspots}]"
+        )
+
+
+    # Diffusion T override
+    if args.steps is not None:
+        cmd.append(
+            f"diffuser.T={args.steps}"
+        )
+
+
+    # Partial diffusion
+    if args.partial_t is not None:
+        cmd.append(
+            f"diffuser.partial_T={args.partial_t}"
+        )
+
+    # LIVE timestep PDB dump
+
+    live_dir = None
+
+    if args.live:
+
+        # shared filesystem에 live directory 생성
+        live_dir = make_live_directory(
+            args.output,
+            args.live_dir
+        )
+
+        cmd.append(
+            "inference.dump_pdb=True"
+        )
+
+        cmd.append(
+            f"inference.dump_pdb_path={live_dir}"
+        )
+
+
+    # run configuration 기록
+    config = {
+
+        "input": (
+            str(input_pdb)
+            if input_pdb
+            else None
+        ),
+
+        "contig": contig,
+
+        "native_contig_input": args.contig,
+
+        "binder_mode": binder_mode,
+
+        "target_contig": args.target_contig,
+
+        "binder_length": args.binder_length,
+
+        "hotspot": args.hotspot,
+
+        "output": args.output,
+
+        "num_designs": args.num_designs,
+
+        "model": model,
+
+        "checkpoint": str(ckpt),
+
+        "steps": args.steps,
+
+        "partial_t": args.partial_t,
+
+        "live": args.live,
+
+        "live_directory": (
+            str(live_dir)
+            if live_dir
+            else None
+        ),
+
+        "command": cmd,
+    }
+
+
+    config_file = (
+        run_dir / "run_config.json"
+    )
+
+    with open(
+        config_file,
+        "w"
+    ) as f:
+
+        json.dump(
+            config,
+            f,
+            indent=2
+        )
+
+    # 실행 정보 출력
+    print("=" * 70)
+    print("RFdiffusion server launcher")
+    print("=" * 70)
+
+    print(
+        f"Input       : "
+        f"{input_pdb or '[none]'}"
+    )
+
+    print(
+        f"Contig      : "
+        f"{contig}"
+    )
+
+    print(
+        f"Hotspots    : "
+        f"{args.hotspot or '[none]'}"
+    )
+
+    print(
+        f"Model       : "
+        f"{model}"
+    )
+
+    print(
+        f"Checkpoint  : "
+        f"{ckpt.name}"
+    )
+
+    print(
+        f"Num designs : "
+        f"{args.num_designs}"
+    )
+
+    print(
+        f"Output dir  : "
+        f"{run_dir}"
+    )
+
+
+    # live mode일 경우 timestep PDB 저장 위치 표시
+    if args.live:
+
+        print(
+            f"Live mode   : ON"
+        )
+
+        print(
+            f"Live dir    : "
+            f"{live_dir}"
+        )
+
+        if args.num_designs > 1:
+            print(
+                "WARNING     : For live visualization, "
+                "num-designs=1 is recommended."
+            )
+
+    else:
+
+        print(
+            "Live mode   : OFF"
+        )
+
+
+    print("=" * 70)
+    print()
+
+    print("Executing:")
+
+    print(
+        " ".join(
+            str(x)
+            for x in cmd
+        )
+    )
+
+    print()
+
+
+    # ========================================================
+    # RFdiffusion 실행
+    # ========================================================
+    #
+    # cwd를 RFdiffusion repository로 설정
+    #
+
+    subprocess.run(
+        cmd,
+        cwd=RF_DIR,
+        check=True,
+    )
+
+
+    # ========================================================
+    # 완료
+    # ========================================================
+
+    print()
+    print("=" * 70)
+    print("RFdiffusion completed")
+
+    print(
+        f"Results: "
+        f"{run_dir}"
+    )
+
+    if live_dir:
+
+        print(
+            f"Live PDBs: "
+            f"{live_dir}"
+        )
+
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
